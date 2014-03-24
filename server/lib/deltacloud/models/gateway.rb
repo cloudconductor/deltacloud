@@ -1,3 +1,4 @@
+#
 # Licensed to the Apache Software Foundation (ASF) under one or more
 # contributor license agreements.  See the NOTICE file distributed with
 # this work for additional information regarding copyright ownership.  The
@@ -16,26 +17,23 @@
 # Change Log
 # 2014.03.24 TIS inc. : Implement Gateway function.
 
-require_relative 'models/base_model'
-require_relative 'models/address'
-require_relative 'models/blob'
-require_relative 'models/bucket'
-require_relative 'models/firewall'
-require_relative 'models/firewall_rule'
-require_relative 'models/hardware_profile'
-require_relative 'models/image'
-require_relative 'models/instance'
-require_relative 'models/instance_address'
-require_relative 'models/instance_profile'
-require_relative 'models/key'
-require_relative 'models/load_balancer'
-require_relative 'models/metric'
-require_relative 'models/provider'
-require_relative 'models/realm'
-require_relative 'models/state_machine'
-require_relative 'models/storage_snapshot'
-require_relative 'models/storage_volume'
-require_relative 'models/network'
-require_relative 'models/subnet'
-require_relative 'models/network_interface'
-require_relative 'models/gateway'
+module Deltacloud
+  class Gateway < BaseModel
+
+    attr_accessor :name
+    attr_accessor :network_id
+    attr_accessor :state
+
+    def to_hash(context)
+      r = {
+        :id => id,
+        :name => name,
+        :href => context.subnet_url(id),
+        :state => state,
+      }
+      r[:network] = network_id.nil? ? nil : {:id => network_id, :href => context.network_url(network_id)}
+      r
+    end
+
+  end
+end

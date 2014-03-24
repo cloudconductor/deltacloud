@@ -13,6 +13,9 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
+# Change Log
+# 2014.03.24 TIS inc. : Implement OpenStack FloatingIP function.
+
 module Deltacloud::Collections
   class Addresses < Base
 
@@ -35,7 +38,7 @@ module Deltacloud::Collections
       operation :create, :with_capability => :create_address do
         description "Acquire a new IP address for use with your account."
         control do
-          @address = driver.create_address(credentials, {})
+          @address = driver.create_address(credentials, params)
           status 201    # Created
           response['Location'] = address_url(@address.id)
           respond_to do |format|
@@ -63,7 +66,7 @@ module Deltacloud::Collections
         param :id, :string, :required
         param :instance_id, :string, :required
         control do
-          driver.associate_address(credentials, { :id => params[:id], :instance_id => params[:instance_id]})
+          driver.associate_address(credentials, params)
           status 202   # Accepted
           respond_to do |format|
             format.xml

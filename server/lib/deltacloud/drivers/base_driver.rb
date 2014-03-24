@@ -14,6 +14,9 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
+# Change Log
+# 2014.03.24 TIS inc. : Implement Gateway function.
+
 module Deltacloud
 
   require_relative '../core_ext.rb'
@@ -269,6 +272,10 @@ module Deltacloud
 
     def network_interface(credentials, opts={})
       network_interfaces(credentials, opts).first if has_capability?(:network_interfaces)
+    end
+
+    def gateway(credentials, opts={})
+      gateways(credentials, opts).first if has_capability?(:gateways)
     end
 
     MEMBER_SHOW_METHODS = [ :realm, :image, :instance, :storage_volume, :bucket, :blob,

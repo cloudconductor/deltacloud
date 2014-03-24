@@ -14,9 +14,13 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
+# Change Log
+# 2014.03.24 TIS inc. : Implement OpenStack FloatingIP function.
+
 module Deltacloud
   class Address < BaseModel
     attr_accessor :instance_id
+    attr_accessor :ip_address
 
     def initialize(init=nil)
       super(init)
@@ -33,6 +37,7 @@ module Deltacloud
         :associated => associated?
       }
       r[:instance_id] = instance_id if associated?
+      r[:ip_address] = ip_address unless ip_address.nil?
       r
     end
 

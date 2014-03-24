@@ -14,9 +14,17 @@
 # under the License.
 #
 
+# Change Log
+# 2014.03.24 TIS inc. : Implement Gateway function.
+#                       Fix return value name to groupId and Add VPC id parameter in create_firewall method.
+#                       Add egress option in create_firewall_rule method.
+#                       Add ip_address return value in create_address.
+#                       Add Volume attach instance option in create_storage_volume.
+
 require 'aws'
 # Delete this once VPC support is merged upstream
 require_relative 'aws_vpc_monkey_patch'
+require_relative 'aws_vpc_network_monkey_patch'
 
 require_relative '../../runner'
 
@@ -692,11 +700,12 @@ module Deltacloud
         end
 
         def create_storage_volume(credentials, opts=nil)
+          instance = instance(credentials, id: opts[:instance_id])
           ec2 = new_client(credentials)
           opts ||= {}
           opts[:snapshot_id] ||= ""
           opts[:capacity] ||= "1"
-          opts[:realm_id] ||= realms(credentials).first.id
+          opts[:realm_id] ||= instance.realm_id.split(':').first
           safely do
             convert_volume(ec2.create_volume(opts[:snapshot_id], opts[:capacity], opts[:realm_id]))
           end
@@ -778,7 +787,8 @@ module Deltacloud
         def create_address(credentials, opts={})
           ec2 = new_client(credentials)
           safely do
-            Address.new(:id => ec2.allocate_address)
+            eip = ec2.allocate_address
+            Address.new(:id => eip, :ip_address => eip)
           end
         end
 
@@ -835,11 +845,12 @@ module Deltacloud
 #Create firewall
 #--
         def create_firewall(credentials, opts={})
+          result = nil
           ec2 = new_client(credentials)
           safely do
-            ec2.create_security_group(opts["name"], opts["description"])
+            result = ec2.create_security_group(opts["name"], opts["description"], opts["network_id"])
           end
-          Firewall.new( { :id=>opts["name"], :name=>opts["name"],
+          Firewall.new( { :id=>result["groupId"], :name=>opts["name"],
                           :description => opts["description"], :owner_id => "", :rules => [] } )
         end
 
@@ -862,8 +873,13 @@ module Deltacloud
             groups << {"group_name" => k, "owner" =>v}
           end
           safely do
-            ec2.manage_security_group_ingress(opts['id'], opts['port_from'], opts['port_to'], opts['protocol'],
-              "authorize", opts['addresses'], groups)
+            if opts['direction'] == 'egress'
+              ec2.manage_security_group_egress(opts['id'], opts['port_from'], opts['port_to'], opts['protocol'],
+                "authorize", opts['addresses'], groups)
+            else
+              ec2.manage_security_group_ingress(opts['id'], opts['port_from'], opts['port_to'], opts['protocol'],
+                "authorize", opts['addresses'], groups)
+            end
           end
         end
 #--
@@ -960,6 +976,103 @@ module Deltacloud
           client = new_client(credentials)
           safely do
             client.delete_network_interface(nic_id)
+          end
+        end
+
+        def gateways(credentials, opts={})
+          ec2 = new_client(credentials)
+          gateways = []
+          safely do
+            (opts[:id] ? ec2.describe_internet_gateways([opts[:id]]) : ec2.describe_internet_gateways).each do |gateway|
+              gateways << convert_gateway(gateway)
+            end
+          end
+          filter_on(gateways, :id, opts)
+        end
+
+        def create_gateway(credentials, opts={})
+          ec2 = new_client(credentials)
+          safely do
+            gateway = ec2.create_internet_gateway
+            convert_gateway(gateway)
+          end
+        end
+
+        def destroy_gateway(credentials, gateway_id)
+          ec2 = new_client(credentials)
+          safely do
+            ec2.delete_internet_gateway(gateway_id)
+          end
+        end
+
+        def attach_gateway(credentials, opts={})
+          ec2 = new_client(credentials)
+          safely do
+            ec2.attach_internet_gateway(opts[:id], opts[:network_id])
+          end
+        end
+
+        def detach_gateway(credentials, opts={})
+          ec2 = new_client(credentials)
+          safely do
+            gateway = gateways(credentials, {:id => opts[:id]}).first
+            ec2.detach_internet_gateway(opts[:id], gateway.network_id)
+          end
+        end
+
+        def add_interface_to_gateway(credentials, opts={})
+          ec2 = new_client(credentials)
+          safely do
+            # search subnet route table
+            filter = {'Filter.1.Name' => 'association.subnet-id', 'Filter.1.Value' => opts[:subnet_id]}
+            route_table = ec2.describe_route_tables([], filter).first
+            unless route_table
+              # search vpc default route table
+              subnet = subnets(credentials, {:id => opts[:subnet_id]}).first
+              filter = {'Filter.1.Name' => 'vpc-id', 'Filter.1.Value' => subnet.network,
+                        'Filter.2.Name' => 'association.main', 'Filter.2.Value' => true}
+              default_route_table = ec2.describe_route_tables([], filter).first
+              # copy default route table and associate it to specified subnet
+              route_table = ec2.create_route_table(subnet.network)
+              default_route_table[:routes].each do |route|
+                next if route.key?(:gateway_id) && route[:gateway_id] == 'local'
+                ec2.create_route(route_table[:route_table_id],
+                                 route[:destination_cidr_block],
+                                 route.key?(:gateway_id) ? route[:gateway_id] : nil,
+                                 route.key?(:instance_id) ? route[:instance_id] : nil,
+                                 route.key?(:network_interface_id) ? route[:network_interface_id] : nil)
+              end
+              ec2.associate_route_table(route_table[:route_table_id], opts[:subnet_id])
+            end
+            # add default route to internet gateway
+            destination_cidr_block = "0.0.0.0/0"
+            ec2.create_route(route_table[:route_table_id], destination_cidr_block, opts[:id])
+          end
+        end
+
+        def remove_interface_from_gateway(credentials, opts={})
+          ec2 = new_client(credentials)
+          safely do
+            # find default route table
+            gateway = gateways(credentials, {:id => opts[:id]}).first
+            filter = {'Filter.1.Name' => 'vpc-id', 'Filter.1.Value' => gateway.network_id,
+                      'Filter.2.Name' => 'association.main', 'Filter.2.Value' => true}
+            default_route_table = ec2.describe_route_tables([], filter).first
+            # get route tables
+            filter = {'Filter.1.Name' => 'route.gateway-id', 'Filter.1.Value' => opts[:id]}
+            filter.merge!({'Filter.2.Name' => 'association.subnet-id', 'Filter.2.Value' => opts[:subnet_id]}) if opts[:subnet_id]
+            route_tables = ec2.describe_route_tables([], filter)
+            if route_tables.empty?
+              raise Deltacloud::BackendError.new(500, "Gateway", "Cannot find route table which associated with specified subnet")
+            end
+            # disassociate and delete route table
+            route_tables.each do |route_table|
+              associations = route_table[:associations].reject{|as| as.key?(:main) && as[:main] == 'true'}
+              associations.each do |association|
+                ec2.disassociate_route_table(association[:route_table_association_id])
+              end
+              ec2.delete_route_table(route_table[:route_table_id])
+            end
           end
         end
 
@@ -1254,7 +1367,7 @@ module Deltacloud
                                         :allow_protocol => perm[:protocol],
                                         :port_from => perm[:from_port],
                                         :port_to => perm[:to_port],
-                                        :direction => 'ingress',
+                                        :direction => perm[:direction],
                                         :sources => sources})
           end
           Firewall.new(  {  :id => security_group[:aws_group_name],
@@ -1324,6 +1437,23 @@ module Deltacloud
                                   :instance => instance,
                                   :ip_address => nic[:private_ip_address]
                                 })
+        end
+
+        def convert_gateway(gateway)
+          if gateway.key?(:attachments) && !gateway[:attachments].empty?
+            attachment = gateway[:attachments].first
+            network_id = attachment[:vpc_id]
+            state = attachment[:state]
+          else
+            network_id = nil
+            state = nil
+          end
+          Gateway.new({
+            :id => gateway[:internet_gateway_id],
+            :name => gateway[:internet_gateway_id],
+            :network_id => network_id,
+            :state => state
+          })
         end
 
         exceptions do

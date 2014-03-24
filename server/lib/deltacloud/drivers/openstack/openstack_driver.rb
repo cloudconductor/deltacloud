@@ -14,6 +14,9 @@
 # under the License.
 #
 
+# Change Log
+# 2014.03.24 TIS inc. : Implement Gateway, FloatingIP, SecurityGroup functions.
+
 require 'openstack'
 
 module Deltacloud
@@ -214,6 +217,13 @@ module Deltacloud
           if opts[:user_data] && opts[:user_data].length > 0
             params[:user_data]=opts[:user_data]
           end
+          if opts[:subnet_id] && opts[:subnet_id].length > 0
+            subnet = subnets(credentials, {:id => opts[:subnet_id]}).first
+            params[:networks]=[{"uuid" => subnet.network}] unless subnet.nil?
+          end
+          the_firewalls = firewalls(credentials, {})
+          firewall_names = opts.inject([]){|res, (k,v)| res << the_firewalls.find {|fw| fw.id== v}.name if k =~ /firewalls\d+$/; res}
+          params[:security_groups] = firewall_names unless firewall_names.empty?
           safely do
             server = os.create_server(params)
             result = convert_from_server(server, os.connection.authuser, get_attachments(server.id, os))
@@ -515,7 +525,7 @@ module Deltacloud
           os = new_client(credentials, "network")
           safely do
             net = os.create_network(opts[:name] || "net_#{Time.now.to_i}")
-            convert_network(net)
+            convert_network(net, [])
           end
         end
 
@@ -604,6 +614,243 @@ module Deltacloud
           end
         end
 
+        def gateways(credentials, opts={})
+          os = new_client(credentials, "network")
+          routers = []
+          safely do
+            if opts[:id]
+              begin
+                response = os.connection.req("GET", "/routers/#{opts[:id]}")
+                routers << convert_gateway(JSON.parse(response.body)["router"])
+              rescue => e
+                raise e unless e.message =~ /Router .* could not be found/
+                routers = []
+              end
+            else
+              response = os.connection.req("GET", "/routers")
+              routers = JSON.parse(response.body)["routers"].inject([]){|res, current| res << convert_gateway(current); res }
+            end
+          end
+          filter_on(routers, :id, opts)
+        end
+
+        def create_gateway(credentials, opts={})
+          os = new_client(credentials, "network")
+          safely do
+            request_hash = {"router" => {"name" => opts[:name]}}
+            request_body = JSON.generate(request_hash)
+            response = os.connection.req("POST", "/routers", {:data => request_body})
+            convert_gateway(JSON.parse(response.body)["router"])
+          end
+        end
+
+        def destroy_gateway(credentials, gateway_id)
+          os = new_client(credentials, "network")
+          safely do
+            os.connection.req("DELETE", "/routers/#{gateway_id}")
+          end
+        end
+
+        def attach_gateway(credentials, opts={})
+          os = new_client(credentials, "network")
+          safely do
+            routers = JSON.parse(os.connection.req("GET", "/routers").body)["routers"]
+            external_network_ids = routers.map{|r| r["external_gateway_info"]}.compact.uniq.map{|n| n["network_id"]}
+            network_id = external_network_ids.first
+            request_body = JSON.generate({"router" => {"external_gateway_info" => {"network_id" => network_id}}})
+            response = os.connection.req("PUT", "/routers/#{opts[:id]}", {:data => request_body})
+            convert_gateway(JSON.parse(response.body)["router"])
+          end
+        end
+
+        def detach_gateway(credentials, opts={})
+          os = new_client(credentials, "network")
+          safely do
+            request_body = JSON.generate({"router" => {"external_gateway_info" => nil}})
+            response = os.connection.req("PUT", "/routers/#{opts[:id]}", {:data => request_body})
+            convert_gateway(JSON.parse(response.body)["router"])
+          end
+        end
+
+        def add_interface_to_gateway(credentials, opts={})
+          os = new_client(credentials, "network")
+          safely do
+            request_body = JSON.generate({:subnet_id => opts[:subnet_id]})
+            os.connection.req("PUT", "/routers/#{opts[:id]}/add_router_interface", {:data => request_body})
+          end
+        end
+
+        def remove_interface_from_gateway(credentials, opts={})
+          os = new_client(credentials, "network")
+          safely do
+            if opts[:subnet_id]
+              subnet_ids = [opts[:subnet_id]]
+            else
+              interfaces = network_interfaces(credentials).select{|interface| interface.instance == opts[:id]}
+              subnet_ids = interfaces.map{|interface| interface.network}
+            end
+            subnet_ids.each do |subnet_id|
+              request_body = JSON.generate({:subnet_id => subnet_id})
+              os.connection.req("PUT", "/routers/#{opts[:id]}/remove_router_interface", {:data => request_body})
+            end
+          end
+        end
+
+        def addresses(credentials, opts={})
+          os = new_client(credentials, "network")
+          addresses = []
+          safely do
+            if opts[:id]
+              begin
+                response = os.connection.req("GET", "/floatingips/#{opts[:id]}")
+                address = JSON.parse(response.body)["floatingip"]
+                addresses << convert_address(JSON.parse(response.body), credentials)
+              rescue => e
+                raise e unless e.message =~ /Floating IP .* could not be found/
+                addresses = []
+              end
+            else
+              response = os.connection.req("GET", "/floatingips")
+              addresses = JSON.parse(response.body)["floatingips"].inject([]){|res, current| res << convert_address(current, credentials); res}
+            end
+          end
+          filter_on(addresses, :id, opts)
+        end
+
+        def create_address(credentials, opts={})
+          os = new_client(credentials, "network")
+          safely do
+            if opts[:network_id]
+              network_id = opts[:network_id]
+            else
+              routers = JSON.parse(os.connection.req("GET", "/routers").body)["routers"]
+              external_network_ids = routers.map{|r| r["external_gateway_info"]}.compact.uniq.map{|n| n["network_id"]}
+              network_id = external_network_ids.first
+            end
+            request_hash = {"floatingip" => {"floating_network_id" => network_id}}
+            request_hash["floatingip"]["port_id"] = opts[:port_id] if opts[:port_id]
+            request_body = JSON.generate(request_hash)
+            response = os.connection.req("POST", "/floatingips", {:data => request_body})
+            convert_address(JSON.parse(response.body)["floatingip"])
+          end
+        end
+
+        def destroy_address(credentials, opts={})
+          os = new_client(credentials, "network")
+          safely do
+            os.connection.req("DELETE", "/floatingips/#{opts[:id]}")
+          end
+        end
+
+        def associate_address(credentials, opts={})
+          os = new_client(credentials, "network")
+          safely do
+            if opts[:network_interface_id]
+              port_id = opts[:network_interface_id]
+            else
+              instance = self.instances(credentials, {:id => opts[:instance_id]}).first
+              port_id = instance.network_interfaces.first
+            end
+            request_body = JSON.generate({"floatingip" => {"port_id" => port_id}})
+            os.connection.req("PUT", "/floatingips/#{opts[:id]}", {:data => request_body})
+          end
+        end
+
+        def disassociate_address(credentials, opts={})
+          os = new_client(credentials, "network")
+          safely do
+            request_body = JSON.generate({"floatingip" => {"port_id" => nil}})
+            os.connection.req("PUT", "/floatingips/#{opts[:id]}", {:data => request_body})
+          end
+        end
+
+        def firewalls(credentials, opts={})
+          os = new_client(credentials, "network")
+          the_firewalls = []
+          response = nil
+          safely do
+            if opts[:id]
+              begin
+                response = os.connection.req("GET", "/security-groups/#{opts[:id]}")
+                the_firewalls << convert_firewall(JSON.parse(response.body)["security_group"])
+              rescue => e
+                raise e unless e.message =~ /Security-groups .* could not be found/
+                routers = []
+              end
+            else
+              response = os.connection.req("GET", "/security-groups")
+              JSON.parse(response.body)["security_groups"].each do |security_group|
+                the_firewalls << convert_firewall(security_group)
+              end
+            end
+          end
+          the_firewalls
+        end
+
+        def create_firewall(credentials, opts={})
+          os = new_client(credentials, "network")
+          request_body = JSON.generate({:security_group =>
+                                        {:name => opts[:name], :description => opts[:description]}})
+          the_firewall = nil
+          safely do
+            response = os.connection.req("POST", "/security-groups", {:data => request_body})
+            the_firewall = convert_firewall(JSON.parse(response.body)["security_group"])
+          end
+          the_firewall
+        end
+
+        def delete_firewall(credentials, opts={})
+          os = new_client(credentials, "network")
+          safely do
+            os.connection.req("DELETE", "/security-groups/#{opts[:id]}")
+          end
+        end
+
+        def create_firewall_rule(credentials, opts={})
+          os = new_client(credentials, "network")
+          groups = []
+          opts['groups'].each do |k, v|
+            groups << {"group_name" => k, "owner" => v}
+          end
+          request_bodys = []
+          groups.each do |group|
+            request_bodys << JSON.generate({:security_group_rule => {
+              :protocol => opts[:protocol],
+              :port_range_min => opts[:port_from],
+              :port_range_max => opts[:port_to],
+              :remote_group_id => group,
+              :direction => opts[:direction],
+              :ethertype => opts[:ethertype],
+              :security_group_id => opts[:id],
+            }})
+          end
+          opts[:addresses].each do |address|
+            request_bodys << JSON.generate({:security_group_rule => {
+              :protocol => opts[:protocol],
+              :port_range_min => opts[:port_from],
+              :port_range_max => opts[:port_to],
+              :remote_ip_prefix => address,
+              :direction => opts[:direction],
+              :ethertype => opts[:ethertype],
+              :security_group_id => opts[:id],
+            }})
+          end
+          safely do
+            request_bodys.each do |request_body|
+              response = os.connection.req('POST', "/security-group-rules", {:data => request_body})
+              convert_firewall_rule(JSON.parse(response.body)["security_group_rule"])
+            end
+          end
+        end
+
+        def delete_firewall_rule(credentials, opts={})
+          os = new_client(credentials, "network")
+          safely do
+            os.connection.req("DELETE", "/security-group-rules/#{opts[:rule_id]}")
+          end
+        end
+
+
 private
         #for v2 authentication credentials.name == "username+tenant_name"
         def new_client(credentials, type="compute", ignore_provider=false)
@@ -628,7 +875,7 @@ private
             raise ValidationFailure.new(Exception.new("Error: tried to initialise Openstack connection using" +
                     " an unknown service_type: #{type}")) unless ["volume", "compute", "object-store", "network"].include? type
             OpenStack::Connection.create(connection_params)
-           end
+          end
         end
 
 #NOTE: for the convert_from_foo methods below... openstack-compute
@@ -765,7 +1012,7 @@ private
                               :created => vol.created_at,
                               :state => (vol.attachments.inject([]){|res, cur| res << cur if cur.size > 0 ; res}.empty?) ? "AVAILABLE" : "IN-USE",
                               :capacity => vol.size,
-                              :instance_id => (vol.attachments.first["serverId"] unless vol.attachments.empty?),
+                              :instance_id => (vol.attachments.first["server_id"] unless vol.attachments.empty?),
                               :device => (vol.attachments.first["device"] unless vol.attachments.empty?),
                               :realm_id => vol.availability_zone,
                               :description => vol.display_description # openstack volumes have a display_description attr
@@ -829,6 +1076,70 @@ private
                       :ip_address =>port.fixed_ips.first["ip_address"]
                       # this is a structure; [{"subnet_id": ID, "ip_address": addr}] - COULD BE >1 address here...
           })
+        end
+
+        def convert_gateway(router)
+          external_network_id = router["external_gateway_info"].nil? ? nil : router["external_gateway_info"]["network_id"]
+          Gateway.new({
+            :id => router["id"],
+            :name => router["name"],
+            :network_id => external_network_id,
+            :state => router["status"]
+          })
+        end
+
+        def convert_address(address, credentials=nil)
+          Address.new({ :id => address["id"],
+                        :ip_address => address["floating_ip_address"],
+                        :instance_id => address["port_id"] # set port_id instead of instance_id
+          })
+        end
+
+        def convert_firewall(security_group)
+          rules = []
+          security_group["security_group_rules"].each do |perm|
+            rules << convert_firewall_rule(perm)
+          end
+          Firewall.new(  {  :id => security_group['id'],
+                            :name => security_group['name'],
+                            :description => security_group['description'],
+                            :owner_id => security_group['tenant_id'],
+                            :rules => rules
+                      }  )
+        end
+
+        def convert_firewall_rule(perm)
+          sources = []
+          unless perm["remote_group_id"].nil?
+            sources << {:type => "group",
+                        :name => perm["remote_group_id"],
+                        :owner => perm["tenant_id"]}
+          end
+          unless perm["remote_ip_prefix"].nil?
+            sources << {:type => "address", :family=>perm["ethertype"],
+                        :address=>perm["remote_ip_prefix"].split("/").first,
+                        :prefix=>perm["remote_ip_prefix"].split("/").last}
+          end
+          if perm["remote_group_id"].nil? && perm["remote_ip_prefix"].nil?
+            if perm["ethertype"] == "IPv4"
+              sources << {:type => "address", :family=>perm["ethertype"],
+                          :address=>"0.0.0.0", :prefix=>"0"}
+            elsif perm["ethertype"] == "IPv6"
+              sources << {:type => "address", :family=>perm["ethertype"],
+                          :address=>"::", :prefix=>"0"}
+            end 
+          end
+          if perm["protocol"].nil?
+            protocol = 'all'
+          else
+            protocol = perm["protocol"]
+          end
+          FirewallRule.new({:id => perm["id"],
+                                     :allow_protocol => protocol,
+                                     :port_from => perm["port_range_min"],
+                                     :port_to => perm["port_range_max"],
+                                     :direction => perm["direction"],
+                                     :sources => sources})
         end
 
         #IN: path1='server_path1'. content1='contents1', path2='server_path2', content2='contents2' etc
